@@ -8,8 +8,9 @@ Override the strategy methods below to implement your bot.
 Strategy:
 1. Probability Density Model: Calculates a heatmap of all possible ship positions
    weighted by current hits (Hunt/Target algorithm).
-2. Placement: Uses an inverse probability map to place ships in the least likely
-   spots (edges/corners) to minimize enemy hit probability.
+2. Placement:
+   - Uses an inverse probability map to place ships in the least likely spots (edges/corners).
+   - Enforces a "Spacing Constraint": No two ships can touch (1-cell gap) to prevent clustering.
 3. Abilities:
    - Hailstorm (HS): Used immediately if the enemy board is empty (Turn 1).
    - Shield (SD): Used if we take > 5 hits to prolong survival.
@@ -23,10 +24,8 @@ class MyBattleshipBot(BattleshipBotAPI):
 
     def __init__(self):
         super().__init__()
-        # Standard battleship sizes: 1x4, 1x3, 2x3 (treated as 6 cells? No, sizes are Dimensions), 1x2.
-        # Note: The API says sizes are (1,4), (1,3), (2,3), (1,2).
-        # We assume standard linear behavior for probability calculation mostly,
-        # but 2x3 is a block. We will handle dimensions generically.
+        # Dimensions derived from battleship_api.SHIP_SIZES
+        # Used for generic probability calculations
         self.ship_dimensions = [(1, 4), (1, 3), (2, 3), (1, 2)]
 
     def ability_selection(self) -> list:
@@ -38,28 +37,60 @@ class MyBattleshipBot(BattleshipBotAPI):
     def place_ship_strategy(self, ship_name: str, game_state: dict) -> dict:
         """
         Place a ship on your board.
-        Strategy: Place on the LEAST probable spots based on an empty board heatmap.
-        This naturally pushes ships to corners and edges.
+        Strategy: Place on LEAST probable spots + Ensure no adjacency to other ships.
         """
         # 1. Calculate probability map for an empty board (N everywhere)
-        # We create a dummy empty grid for this calculation
+        # This highlights the center as "high prob" and corners as "low prob"
         empty_grid = [['N'] * 8 for _ in range(8)]
         heatmap = self._calculate_probability_map(empty_grid)
 
         placed_coords = self._get_placed_coordinates(game_state)
 
-        # 2. Get all cells, sort them by probability (Ascending -> Lowest prob first)
+        # 2. Calculate "Forbidden Buffer": Cells adjacent to existing ships
+        # This ensures we don't place ships touching each other
+        forbidden_buffer = set()
+        for r, c in placed_coords:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < 8 and 0 <= nc < 8:
+                    forbidden_buffer.add((nr, nc))
+
+        # 3. Sort board cells by probability (Ascending -> place in low prob areas first)
         cells_with_prob = []
         for r in range(8):
             for c in range(8):
                 cells_with_prob.append(((r, c), heatmap[r][c]))
 
-        # Sort by probability score (lowest first)
         cells_with_prob.sort(key=lambda x: x[1])
 
-        # 3. Try to place the ship starting from the best (lowest prob) cell
+        # 4. Attempt Strict Placement (No Overlap + No Adjacency)
         for (r, c), prob in cells_with_prob:
-            # Try both orientations
+            for orientation in ['H', 'V']:
+                ship_cells = self._get_ship_cells(ship_name, r, c, orientation)
+
+                # Skip invalid bounds
+                if not ship_cells:
+                    continue
+
+                # Check 1: Must not overlap existing ships
+                if not self._is_valid_placement(ship_cells, placed_coords):
+                    continue
+
+                # Check 2: Must not touch existing ships (Buffer check)
+                if any(cell in forbidden_buffer for cell in ship_cells):
+                    continue
+
+                return {
+                    "placement": {
+                        "name": ship_name,
+                        "cell": [r, c],
+                        "direction": orientation
+                    }
+                }
+
+        # 5. Fallback: Relaxed Placement (Allow Adjacency if necessary)
+        # If the board is too crowded for gaps, just find any valid spot
+        for (r, c), prob in cells_with_prob:
             for orientation in ['H', 'V']:
                 ship_cells = self._get_ship_cells(ship_name, r, c, orientation)
                 if ship_cells and self._is_valid_placement(ship_cells, placed_coords):
@@ -71,11 +102,11 @@ class MyBattleshipBot(BattleshipBotAPI):
                         }
                     }
 
-        # Fallback (should theoretically not be reached if board is open)
+        # 6. Final Fallback (Should typically not be reached)
         return self._get_random_placement(ship_name, placed_coords)
 
     def combat_strategy(self, game_state: dict) -> dict:
-        """Choose a combat move."""
+        """Choose a combat move based on Probability Density."""
         opponent_grid = self._get_opponent_grid(game_state)
         available_abilities = self._get_available_abilities(game_state)
         my_ships = self._get_own_ships(game_state)
@@ -87,7 +118,7 @@ class MyBattleshipBot(BattleshipBotAPI):
             return {
                 "combat": {
                     "cell": [0, 0],  # Cell ignored for HS
-                    "ability": {"HS": {}}  # Payload for HS
+                    "ability": {"HS": {}}
                 }
             }
 
@@ -95,23 +126,18 @@ class MyBattleshipBot(BattleshipBotAPI):
         # If we have taken significant damage (>5 hits total), use Shield
         total_hits_taken = sum(len(ship.get("hits", [])) for ship in my_ships)
         if total_hits_taken > 5 and "SD" in available_abilities:
-            # Find a ship that is alive but maybe damaged to protect
             target_ship_coord = self._get_best_shield_target(my_ships)
             if target_ship_coord:
                 return {
                     "combat": {
-                        "cell": target_ship_coord,  # Cell usually ignored, but good to set
-                        "ability": {"SD": target_ship_coord}  # Shield needs a ship coordinate
+                        "cell": target_ship_coord,
+                        "ability": {"SD": target_ship_coord}
                     }
                 }
 
         # --- SHOOTING STRATEGY: PROBABILITY DENSITY ---
         # Calculate the heatmap based on current hits/misses
         heatmap = self._calculate_probability_map(opponent_grid)
-
-        # Find the single highest probability cell that hasn't been shot
-        best_cell = [0, 0]
-        max_score = -1
 
         available_cells = self._get_available_cells(opponent_grid)
 
@@ -122,14 +148,14 @@ class MyBattleshipBot(BattleshipBotAPI):
             score = heatmap[r][c]
             candidates.append((score, cell))
 
-        # Shuffle equal scores to prevent deterministic loops
+        # Shuffle equal scores to prevent deterministic loops on zero-info turns
         random.shuffle(candidates)
 
+        best_cell = [0, 0]
         if candidates:
-            # Pick the one with highest score
+            # Pick the one with highest probability score
             best_cell = max(candidates, key=lambda x: x[0])[1]
         else:
-            # Fallback if board is full (unlikely)
             best_cell = [random.randint(0, 7), random.randint(0, 7)]
 
         return {
@@ -147,34 +173,21 @@ class MyBattleshipBot(BattleshipBotAPI):
         """
         Generates an 8x8 grid where each cell's value represents the probability
         of a ship occupying that cell.
-
-        Logic:
-        1. Iterate through every possible placement of every ship type.
-        2. If a placement overlaps a Miss (M) or Block (B), it's invalid.
-        3. If a placement fits:
-           - Base score +1 per cell.
-           - If it overlaps a Hit (H), Massive Bonus (Enter Target Mode).
-        4. Accumulate scores on the heatmap.
         """
         heatmap = [[0.0] * 8 for _ in range(8)]
 
         # Weights
         BASE_WEIGHT = 1
-        HIT_WEIGHT = 100  # High weight implies: "A ship definitely fits here and connects to a hit"
+        HIT_WEIGHT = 100  # Heavily weight alignments that overlap 'H'
 
-        # We assume all ships are potentially still in play to keep the heatmap robust.
-        # This acts as a superposition of all possible remaining ships.
+        # Superposition of all ship types
         for r_dim, c_dim in self.ship_dimensions:
-            # Check horizontal placements of this shape
-            # To handle NxM generic logic (including 2x3)
-            # We treat the shape as a block of offsets
 
-            # Generate offsets for this shape (Standard orientation)
+            # Generate offsets for this shape (Standard)
             offsets = []
             for r in range(r_dim):
                 for c in range(c_dim):
                     offsets.append((r, c))
-
             self._add_configuration_weights(grid, heatmap, offsets, BASE_WEIGHT, HIT_WEIGHT)
 
             # Generate offsets for rotated shape (if not square)
@@ -195,9 +208,6 @@ class MyBattleshipBot(BattleshipBotAPI):
 
     def _add_configuration_weights(self, grid, heatmap, offsets, base_weight, hit_weight):
         """Helper to slide a specific ship shape over the grid."""
-        max_r = 7
-        max_c = 7
-
         # Determine bounds for this shape
         shape_h = max(o[0] for o in offsets)
         shape_w = max(o[1] for o in offsets)
@@ -221,7 +231,6 @@ class MyBattleshipBot(BattleshipBotAPI):
                     coords.append((curr_r, curr_c))
 
                 if valid:
-                    # Calculate weight for this configuration
                     # If it touches a hit, it becomes very probable
                     weight = base_weight + (hit_weight * hit_overlap_count)
 
@@ -230,31 +239,22 @@ class MyBattleshipBot(BattleshipBotAPI):
                         heatmap[cr][cc] += weight
 
     def _get_best_shield_target(self, my_ships: list) -> list:
-        """
-        Returns the coordinate of a ship to shield.
-        Prioritizes: Largest alive ship.
-        """
-        # Sort ships by size (descending), then by hits (descending)
-        # We want to save big ships that are taking fire
-
-        # Filter out sunken ships
+        """Returns the coordinate of the largest alive ship to shield."""
         alive_ships = []
         for ship in my_ships:
             coords = ship.get("coordinates", [])
             hits = ship.get("hits", [])
+            # Only consider ships that are not sunk
             if len(hits) < len(coords):
                 alive_ships.append(ship)
 
         if not alive_ships:
             return None
 
-        # Strategy: Protect the largest ship that is currently alive
-        # (Since size isn't explicitly in dict, infer from coord length)
+        # Protect the largest ship
         alive_ships.sort(key=lambda s: len(s.get("coordinates", [])), reverse=True)
-
         target_ship = alive_ships[0]
 
-        # Return the first coordinate of that ship
         if target_ship.get("coordinates"):
             return target_ship["coordinates"][0]
         return None
